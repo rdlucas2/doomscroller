@@ -1,30 +1,25 @@
+// Package engine drives the game loop, FSM, and all state transitions using Ebiten.
 package engine
 
 import (
+	"fmt"
 	"math/rand"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/rdlucas2/doomscroller/internal/game"
+	"github.com/rdlucas2/doomscroller/internal/render"
 	"github.com/rdlucas2/doomscroller/internal/states"
-	"github.com/rdlucas2/doomscroller/internal/ui"
 )
 
-type worldTickMsg struct{}
-
-func worldTick() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
-		return worldTickMsg{}
-	})
-}
-
-// Engine is the top-level bubbletea model.
+// Engine manages all game state and handles input.
+// It does NOT implement ebiten.Game; that wrapper lives in cmd/doomscroller/main.go.
 type Engine struct {
 	fsm      *FSM
-	width    int
-	height   int
+	input    *InputState
 	settings game.Settings
+	timeSec  float64
 
+	// per-screen state objects
 	intro      *states.IntroState
 	menu       *states.MenuState
 	settingsUI *states.SettingsState
@@ -41,47 +36,159 @@ type Engine struct {
 
 func New() *Engine {
 	rand.Seed(time.Now().UnixNano())
-	s := game.DefaultSettings()
 	e := &Engine{
 		fsm:      NewFSM(),
-		settings: s,
-		width:    80,
-		height:   24,
+		input:    NewInputState(),
+		settings: game.DefaultSettings(),
 		intro:    &states.IntroState{},
 	}
 	return e
 }
 
-func (e *Engine) Init() tea.Cmd {
-	return tea.Batch(e.intro.Init(), worldTick())
-}
+// Update is called by the Ebiten game every frame (60 fps). dt is seconds since last frame.
+func (e *Engine) Update(dt float64) error {
+	e.timeSec += dt
+	e.input.Update()
 
-func (e *Engine) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch m := msg.(type) {
-	case tea.WindowSizeMsg:
-		e.width, e.height = m.Width, m.Height
-		return e, nil
-
-	case tea.KeyMsg:
-		return e.handleKey(m.String())
-
-	case states.IntroTickMsg:
-		done := e.intro.Update(states.IntroTickMsg{})
-		if done {
-			return e, nil
+	// Intro advances purely by time
+	if e.fsm.Current() == StateIntro {
+		e.intro.Update(dt)
+		if e.intro.Done() {
+			// Any key after loading finishes → go to menu
+			for _, k := range e.input.JustPressedKeys() {
+				_ = k
+				e.enterMainMenu()
+				return nil
+			}
 		}
-		return e, e.intro.NextCmd()
-
-	case worldTickMsg:
-		if e.fsm.Current() == StateWorld && e.world != nil {
-			e.world.TickMessage()
-		}
-		return e, worldTick()
+		return nil
 	}
-	return e, nil
+
+	// Route pressed keys to the current state handler
+	for _, key := range e.input.JustPressedKeys() {
+		if err := e.handleKey(key); err != nil {
+			return err
+		}
+	}
+
+	// World: collect typed characters for name input (char creation)
+	if e.fsm.Current() == StateCharCreate && e.charCreate != nil && e.charCreate.Phase == states.PhasePickName {
+		for _, r := range PressedRunes() {
+			e.charCreate.HandleRune(r)
+		}
+	}
+
+	return nil
 }
 
-// ── State entry helpers ───────────────────────────────────────────────────────
+// BuildState produces the snapshot the renderer consumes this frame.
+func (e *Engine) BuildState() *render.EngineState {
+	st := &render.EngineState{
+		State:   render.StateID(e.fsm.Current()),
+		TimeSec: e.timeSec,
+	}
+
+	switch e.fsm.Current() {
+	case StateIntro:
+		st.IntroProgress = e.intro.Progress()
+		st.IntroDone = e.intro.Done()
+
+	case StateMainMenu:
+		if e.menu != nil {
+			st.MenuItems = e.menu.Items()
+			st.MenuCursor = e.menu.Cursor
+		}
+
+	case StateSettings:
+		if e.settingsUI != nil {
+			labels, values, cur := e.settingsUI.ItemsAndValues()
+			st.SettingsLabels = labels
+			st.SettingsValues = values
+			st.SettingsCursor = cur
+		}
+
+	case StateCharCreate:
+		if e.charCreate != nil {
+			cc := e.charCreate
+			st.CharPhase = int(cc.Phase)
+			st.CharName = cc.NameInput
+			st.ClassCursor = cc.ClassCursor
+			classes := []game.Class{game.Warrior, game.Mage, game.Rogue}
+			st.ClassCards = make([]render.ClassCardData, len(classes))
+			for i, cls := range classes {
+				d := game.NewCharacter("x", cls)
+				st.ClassCards[i] = render.ClassCardData{
+					Name: cls.String(),
+					Desc: cls.Description(),
+					HP: d.MaxHP, MP: d.MaxMP,
+					STR: d.STR, INT: d.INT, AGI: d.AGI, DEF: d.DEF,
+				}
+			}
+			st.ClassName = classes[cc.ClassCursor].String()
+			st.ConfirmCursor = cc.ConfirmCursor
+			if cc.Phase == states.PhaseConfirm {
+				c := cc.BuildCharacter()
+				st.ConfirmStats = render.ConfirmStatsData{
+					HP: c.MaxHP, MP: c.MaxMP,
+					STR: c.STR, INT: c.INT, AGI: c.AGI, DEF: c.DEF,
+					Weapon: c.Equipment.Weapon, Armor: c.Equipment.Armor,
+				}
+			}
+		}
+
+	case StateWorld:
+		if e.world != nil && e.session != nil {
+			st.Session = e.session
+			st.WorldMsg = e.world.Message
+			st.PlayerSprite = playerSpriteID(e.session.Character.Class, 0)
+			// Walk animation: alternate every 8 steps
+			st.WalkFrame = (e.session.StepCount / 4) % 2
+		}
+
+	case StateBattle:
+		if e.battleUI != nil {
+			st.Battle = e.battleUI.Battle
+			if e.session != nil {
+				st.PlayerSprite = playerSpriteID(e.session.Character.Class, 0)
+			}
+		}
+
+	case StateStory:
+		if e.storyUI != nil {
+			st.Story = e.storyUI.Beat
+			st.StoryLine = e.storyUI.Line
+		}
+
+	case StatePause:
+		if e.pauseUI != nil {
+			st.PauseCursor = e.pauseUI.Cursor
+			st.PauseItems = []string{"Resume", "Save & Quit Run", "Settings", "Quit to Main Menu"}
+		}
+
+	case StateGameOver:
+		if e.gameOverUI != nil {
+			st.GameOverChar = e.gameOverUI.Character
+			st.GameOverFloor = e.gameOverUI.Floor
+			st.GameOverCursor = e.gameOverUI.Cursor
+			st.GameOverItems = []string{"New Game", "Main Menu", "Quit"}
+		}
+
+	case StateWin:
+		if e.winUI != nil {
+			st.WinChar = e.winUI.Character
+			st.WinCursor = e.winUI.Cursor
+			st.WinItems = []string{"New Game", "Main Menu", "Quit"}
+		}
+	}
+	return st
+}
+
+func playerSpriteID(cls game.Class, frame int) int {
+	base := int(cls) * 2
+	return base + frame
+}
+
+// ── state entry helpers ───────────────────────────────────────────────────────
 
 func (e *Engine) enterMainMenu() {
 	e.menu = states.NewMenuState()
@@ -160,14 +267,12 @@ func (e *Engine) enterWin() {
 	e.fsm.Transition(StateWin)
 }
 
-// ── Key handlers ─────────────────────────────────────────────────────────────
+// ── key routing ───────────────────────────────────────────────────────────────
 
-func (e *Engine) handleKey(key string) (tea.Model, tea.Cmd) {
+var errQuit = fmt.Errorf("quit")
+
+func (e *Engine) handleKey(key string) error {
 	switch e.fsm.Current() {
-	case StateIntro:
-		if e.intro.Done() {
-			e.enterMainMenu()
-		}
 	case StateMainMenu:
 		return e.handleMenuKey(key)
 	case StateSettings:
@@ -187,20 +292,17 @@ func (e *Engine) handleKey(key string) (tea.Model, tea.Cmd) {
 	case StateWin:
 		return e.handleWinKey(key)
 	}
-	return e, nil
+	return nil
 }
 
-func (e *Engine) handleMenuKey(key string) (tea.Model, tea.Cmd) {
-	m := e.menu
+func (e *Engine) handleMenuKey(key string) error {
 	switch key {
-	case "ctrl+c":
-		return e, tea.Quit
 	case "up", "k":
-		m.MoveUp()
+		e.menu.MoveUp()
 	case "down", "j":
-		m.MoveDown()
+		e.menu.MoveDown()
 	case "enter", " ":
-		switch m.Selected() {
+		switch e.menu.Selected() {
 		case states.MenuNewGame:
 			e.enterCharCreate()
 		case states.MenuContinue:
@@ -208,13 +310,13 @@ func (e *Engine) handleMenuKey(key string) (tea.Model, tea.Cmd) {
 		case states.MenuSettings:
 			e.enterSettings()
 		case states.MenuQuit:
-			return e, tea.Quit
+			return errQuit
 		}
 	}
-	return e, nil
+	return nil
 }
 
-func (e *Engine) handleSettingsKey(key string) (tea.Model, tea.Cmd) {
+func (e *Engine) handleSettingsKey(key string) error {
 	s := e.settingsUI
 	switch key {
 	case "esc", "q":
@@ -232,10 +334,10 @@ func (e *Engine) handleSettingsKey(key string) (tea.Model, tea.Cmd) {
 			e.fsm.Pop()
 		}
 	}
-	return e, nil
+	return nil
 }
 
-func (e *Engine) handleCharCreateKey(key string) (tea.Model, tea.Cmd) {
+func (e *Engine) handleCharCreateKey(key string) error {
 	cc := e.charCreate
 	switch cc.Phase {
 	case states.PhasePickName:
@@ -246,16 +348,16 @@ func (e *Engine) handleCharCreateKey(key string) (tea.Model, tea.Cmd) {
 			if cc.IsNameReady() {
 				cc.Phase = states.PhasePickClass
 			}
-		default:
-			cc.HandleNameKey(key)
+		case "backspace":
+			cc.HandleBackspace()
 		}
 	case states.PhasePickClass:
 		switch key {
 		case "esc":
 			cc.Phase = states.PhasePickName
-		case "left", "h":
+		case "left", "h", "a":
 			cc.MoveClassLeft()
-		case "right", "l":
+		case "right", "l", "d":
 			cc.MoveClassRight()
 		case "enter", " ":
 			cc.Phase = states.PhaseConfirm
@@ -274,25 +376,21 @@ func (e *Engine) handleCharCreateKey(key string) (tea.Model, tea.Cmd) {
 			}
 		case "enter", " ":
 			if cc.ConfirmCursor == 0 {
-				c := cc.BuildCharacter()
-				e.startNewGame(c)
+				e.startNewGame(cc.BuildCharacter())
 			} else {
 				cc.Phase = states.PhasePickClass
 			}
 		}
 	}
-	return e, nil
+	return nil
 }
 
-func (e *Engine) handleWorldKey(key string) (tea.Model, tea.Cmd) {
+func (e *Engine) handleWorldKey(key string) error {
 	switch key {
-	case "ctrl+c":
-		return e, tea.Quit
-	case "p", "P", "esc":
+	case "p", "esc":
 		e.enterPause()
-		return e, nil
+		return nil
 	}
-
 	var dx, dy int
 	switch key {
 	case "w", "up":
@@ -304,27 +402,24 @@ func (e *Engine) handleWorldKey(key string) (tea.Model, tea.Cmd) {
 	case "d", "right":
 		dx = 1
 	default:
-		return e, nil
+		return nil
 	}
-
 	event := e.world.Move(dx, dy)
 	return e.handleWorldEvent(event)
 }
 
-func (e *Engine) handleWorldEvent(event states.WorldEvent) (tea.Model, tea.Cmd) {
+func (e *Engine) handleWorldEvent(event states.WorldEvent) error {
 	w := e.world
 	switch event {
 	case states.WorldEventRandomBattle:
 		enemies := game.RandomEncounterEnemies(e.session.Floor, e.session.Rng)
 		e.enterBattle(enemies, nil, false)
-
 	case states.WorldEventStoryBeat:
 		if len(w.StoryQueue) > 0 {
 			beat := w.StoryQueue[0]
 			w.StoryQueue = w.StoryQueue[1:]
 			e.enterStory(beat)
 		}
-
 	case states.WorldEventBoss:
 		px, py := e.session.Map.PlayerX, e.session.Map.PlayerY
 		tile := e.session.Map.At(px, py)
@@ -341,31 +436,26 @@ func (e *Engine) handleWorldEvent(event states.WorldEvent) (tea.Model, tea.Cmd) 
 		}
 		boss := game.BossEnemy(bossName, e.session.Floor)
 		e.enterBattle([]*game.Enemy{boss}, storyForBoss, true)
-
 	case states.WorldEventNextFloor:
 		e.session.NextFloor()
 		e.world = states.NewWorldState(e.session)
-		e.world.SetMessage(ui.SuccessStyle.Render("You descend deeper into the tower..."))
-
+		e.world.SetMessage("You descend deeper into the tower...")
 	case states.WorldEventWin:
 		e.enterWin()
 	}
-	return e, nil
+	return nil
 }
 
-func (e *Engine) handleBattleKey(key string) (tea.Model, tea.Cmd) {
+func (e *Engine) handleBattleKey(key string) error {
 	b := e.battleUI.Battle
-
 	switch b.Phase {
 	case game.PhasePerkChoice:
 		e.battleUI.HandlePerkChoice(key)
 	case game.PhaseVictory:
 		if key == "enter" || key == " " {
 			e.fsm.Pop()
-			// After boss victory, show post-battle story
 			if e.battleUI.StoryAfterBattle != nil && !e.battleUI.StoryAfterBattle.Completed {
-				beat := e.battleUI.StoryAfterBattle
-				e.enterStory(beat)
+				e.enterStory(e.battleUI.StoryAfterBattle)
 			}
 		}
 	case game.PhaseDefeat:
@@ -378,10 +468,10 @@ func (e *Engine) handleBattleKey(key string) (tea.Model, tea.Cmd) {
 	default:
 		e.battleUI.HandleInput(key)
 	}
-	return e, nil
+	return nil
 }
 
-func (e *Engine) handleStoryKey(key string) (tea.Model, tea.Cmd) {
+func (e *Engine) handleStoryKey(key string) error {
 	ss := e.storyUI
 	switch key {
 	case "enter", " ":
@@ -390,26 +480,23 @@ func (e *Engine) handleStoryKey(key string) (tea.Model, tea.Cmd) {
 			e.fsm.Pop()
 		}
 	case "esc":
-		// Allow skipping story
 		game.MarkCompleted(ss.Beat.ID)
 		e.fsm.Pop()
 	}
-	return e, nil
+	return nil
 }
 
-func (e *Engine) handlePauseKey(key string) (tea.Model, tea.Cmd) {
+func (e *Engine) handlePauseKey(key string) error {
 	ps := e.pauseUI
 	switch key {
-	case "ctrl+c":
-		return e, tea.Quit
-	case "p", "P", "esc":
+	case "p", "esc":
 		e.fsm.Pop()
 	case "up", "k":
 		ps.MoveUp()
 	case "down", "j":
 		ps.MoveDown()
 	case "enter", " ":
-		switch ps.Selected() {
+		switch states.PauseChoice(ps.Cursor) {
 		case states.PauseResume:
 			e.fsm.Pop()
 		case states.PauseSave:
@@ -427,14 +514,12 @@ func (e *Engine) handlePauseKey(key string) (tea.Model, tea.Cmd) {
 			e.enterMainMenu()
 		}
 	}
-	return e, nil
+	return nil
 }
 
-func (e *Engine) handleGameOverKey(key string) (tea.Model, tea.Cmd) {
+func (e *Engine) handleGameOverKey(key string) error {
 	g := e.gameOverUI
 	switch key {
-	case "ctrl+c":
-		return e, tea.Quit
 	case "up", "k":
 		g.MoveUp()
 	case "down", "j":
@@ -446,17 +531,15 @@ func (e *Engine) handleGameOverKey(key string) (tea.Model, tea.Cmd) {
 		case "Main Menu":
 			e.enterMainMenu()
 		case "Quit":
-			return e, tea.Quit
+			return errQuit
 		}
 	}
-	return e, nil
+	return nil
 }
 
-func (e *Engine) handleWinKey(key string) (tea.Model, tea.Cmd) {
+func (e *Engine) handleWinKey(key string) error {
 	w := e.winUI
 	switch key {
-	case "ctrl+c":
-		return e, tea.Quit
 	case "up", "k":
 		w.MoveUp()
 	case "down", "j":
@@ -468,62 +551,11 @@ func (e *Engine) handleWinKey(key string) (tea.Model, tea.Cmd) {
 		case "Main Menu":
 			e.enterMainMenu()
 		case "Quit":
-			return e, tea.Quit
+			return errQuit
 		}
 	}
-	return e, nil
+	return nil
 }
 
-// ── View ──────────────────────────────────────────────────────────────────────
-
-func (e *Engine) View() string {
-	w, h := e.width, e.height
-	if w < 40 {
-		w = 80
-	}
-	if h < 20 {
-		h = 24
-	}
-
-	switch e.fsm.Current() {
-	case StateIntro:
-		return e.intro.View(w, h)
-	case StateMainMenu:
-		if e.menu != nil {
-			return e.menu.View(w, h)
-		}
-	case StateSettings:
-		if e.settingsUI != nil {
-			return e.settingsUI.View(w, h)
-		}
-	case StateCharCreate:
-		if e.charCreate != nil {
-			return e.charCreate.View(w, h)
-		}
-	case StateWorld:
-		if e.world != nil {
-			return e.world.View(w, h)
-		}
-	case StateBattle:
-		if e.battleUI != nil {
-			return e.battleUI.View(w, h)
-		}
-	case StateStory:
-		if e.storyUI != nil {
-			return e.storyUI.View(w, h)
-		}
-	case StatePause:
-		if e.pauseUI != nil {
-			return e.pauseUI.View(w, h)
-		}
-	case StateGameOver:
-		if e.gameOverUI != nil {
-			return e.gameOverUI.View(w, h)
-		}
-	case StateWin:
-		if e.winUI != nil {
-			return e.winUI.View(w, h)
-		}
-	}
-	return ""
-}
+// IsQuit returns true when the engine signalled an exit.
+func IsQuit(err error) bool { return err == errQuit }
